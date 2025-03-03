@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -642,5 +644,522 @@ func TestErrorTrackingRecoveryTimeExpiration(t *testing.T) {
 	}
 	if percentage, exists := percentages[401]; !exists || percentage != 100 {
 		t.Errorf("Expected 100%% 401 errors after recovery, got %.2f%%", percentage)
+	}
+}
+
+func TestClearAllModelData(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Failed to create miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	client, err := NewClient(Config{
+		Addr:     mr.Addr(),
+		Password: "",
+		DB:       0,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create Redis client: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Set up various keys for the model
+	keys := []string{
+		fmt.Sprintf("latency:%s:recovery", model),
+		fmt.Sprintf("errors:%s:recovery", model),
+		fmt.Sprintf("latency:%s", model),
+		fmt.Sprintf("latency:%s:counter", model),
+		fmt.Sprintf("errors:%s", model),
+		fmt.Sprintf("errors:%s:counter", model),
+	}
+
+	// Set values in Redis for each key
+	for _, key := range keys {
+		mr.Set(key, "test-value")
+	}
+
+	// Verify keys exist
+	for _, key := range keys {
+		if !mr.Exists(key) {
+			t.Errorf("Key %s does not exist before test", key)
+		}
+	}
+
+	// Call the function to clear all keys
+	err = client.ClearAllModelData(ctx, model)
+	if err != nil {
+		t.Errorf("ClearAllModelData() error = %v", err)
+	}
+
+	// Verify keys no longer exist
+	for _, key := range keys {
+		if mr.Exists(key) {
+			t.Errorf("Key %s still exists after ClearAllModelData", key)
+		}
+	}
+}
+
+func TestGetKeysWithPrefix(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// Set up some test keys
+	testKeys := map[string]string{
+		"prefix:key1":     "value1",
+		"prefix:key2":     "value2",
+		"prefix:subkey:1": "subvalue1",
+		"different:key":   "othervalue",
+		"another:key":     "anothervalue",
+	}
+
+	// Add test keys to Redis
+	for k, v := range testKeys {
+		if err := client.rdb.Set(ctx, k, v, 0).Err(); err != nil {
+			t.Fatalf("Failed to set up test key %s: %v", k, err)
+		}
+	}
+
+	// Test getting keys with prefix
+	tests := []struct {
+		name   string
+		prefix string
+		want   []string
+	}{
+		{
+			name:   "get all prefix keys",
+			prefix: "prefix:*",
+			want:   []string{"prefix:key1", "prefix:key2", "prefix:subkey:1"},
+		},
+		{
+			name:   "get specific subprefix keys",
+			prefix: "prefix:subkey:*",
+			want:   []string{"prefix:subkey:1"},
+		},
+		{
+			name:   "get different keys",
+			prefix: "different:*",
+			want:   []string{"different:key"},
+		},
+		{
+			name:   "get non-existent prefix",
+			prefix: "nonexistent:*",
+			want:   []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := client.GetKeysWithPrefix(ctx, tt.prefix)
+			if err != nil {
+				t.Errorf("GetKeysWithPrefix() error = %v", err)
+				return
+			}
+
+			// Sort both slices for comparison since Redis doesn't guarantee order
+			sort.Strings(got)
+			sort.Strings(tt.want)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetKeysWithPrefix() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetAverageLatencyEdgeCases(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Test with no data
+	avg, err := client.GetAverageLatency(ctx, model, 5)
+	if err != nil {
+		t.Fatalf("GetAverageLatency() error = %v", err)
+	}
+	if avg != 0 {
+		t.Errorf("Expected 0 average for no data, got %v", avg)
+	}
+
+	// Test with single entry
+	err = client.RecordLatency(ctx, model, 1.5, "success")
+	if err != nil {
+		t.Fatalf("RecordLatency() error = %v", err)
+	}
+	avg, err = client.GetAverageLatency(ctx, model, 5)
+	if err != nil {
+		t.Fatalf("GetAverageLatency() error = %v", err)
+	}
+	if avg != 1.5 {
+		t.Errorf("Expected 1.5 average for single entry, got %v", avg)
+	}
+
+	// Test with invalid JSON in Redis
+	key := fmt.Sprintf("latency:%s", model)
+	score := float64(time.Now().UTC().Unix())
+	invalidJSON := "{invalid:json}"
+	err = client.rdb.ZAdd(ctx, key, redis.Z{Score: score, Member: invalidJSON}).Err()
+	if err != nil {
+		t.Fatalf("Failed to add invalid JSON: %v", err)
+	}
+	_, err = client.GetAverageLatency(ctx, model, 5)
+	if err == nil {
+		t.Error("Expected error for invalid JSON, got nil")
+	}
+}
+
+func TestGetErrorPercentagesEdgeCases(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Test with negative n
+	_, err := client.GetErrorPercentages(ctx, model, -1)
+	if err == nil {
+		t.Error("Expected error for negative n, got nil")
+	}
+
+	// Test with zero n
+	percentages, err := client.GetErrorPercentages(ctx, model, 0)
+	if err != nil {
+		t.Fatalf("GetErrorPercentages() error = %v", err)
+	}
+	if len(percentages) != 0 {
+		t.Errorf("Expected empty map for n=0, got %v entries", len(percentages))
+	}
+
+	// Test with no data
+	percentages, err = client.GetErrorPercentages(ctx, model, 5)
+	if err != nil {
+		t.Fatalf("GetErrorPercentages() error = %v", err)
+	}
+	if len(percentages) != 0 {
+		t.Errorf("Expected empty map for no data, got %v entries", len(percentages))
+	}
+
+	// Test with single error code
+	err = client.RecordErrorCode(ctx, model, 500)
+	if err != nil {
+		t.Fatalf("RecordErrorCode() error = %v", err)
+	}
+	percentages, err = client.GetErrorPercentages(ctx, model, 5)
+	if err != nil {
+		t.Fatalf("GetErrorPercentages() error = %v", err)
+	}
+	if len(percentages) != 1 {
+		t.Errorf("Expected 1 entry, got %v", len(percentages))
+	}
+	if percentages[500] != 100.0 {
+		t.Errorf("Expected 100%% for single error, got %v%%", percentages[500])
+	}
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+	done := make(chan bool)
+	errChan := make(chan error, 10)
+
+	// Concurrent latency recording
+	for i := 0; i < 5; i++ {
+		go func(i int) {
+			err := client.RecordLatency(ctx, model, float64(i), "success")
+			if err != nil {
+				errChan <- fmt.Errorf("RecordLatency error: %v", err)
+				return
+			}
+			done <- true
+		}(i)
+	}
+
+	// Concurrent error recording
+	for i := 0; i < 5; i++ {
+		go func(i int) {
+			err := client.RecordErrorCode(ctx, model, 400+i)
+			if err != nil {
+				errChan <- fmt.Errorf("RecordErrorCode error: %v", err)
+				return
+			}
+			done <- true
+		}(i)
+	}
+
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		select {
+		case err := <-errChan:
+			t.Errorf("Concurrent operation failed: %v", err)
+		case <-done:
+			// Operation completed successfully
+		case <-time.After(5 * time.Second):
+			t.Error("Timeout waiting for concurrent operations")
+		}
+	}
+
+	// Verify final state
+	entries, err := client.GetLatencyEntries(ctx, model, 10)
+	if err != nil {
+		t.Fatalf("GetLatencyEntries() error = %v", err)
+	}
+	if len(entries) != 5 {
+		t.Errorf("Expected 5 latency entries, got %d", len(entries))
+	}
+
+	percentages, err := client.GetErrorPercentages(ctx, model, 10)
+	if err != nil {
+		t.Fatalf("GetErrorPercentages() error = %v", err)
+	}
+	if len(percentages) != 5 {
+		t.Errorf("Expected 5 error code entries, got %d", len(percentages))
+	}
+}
+
+func TestRedisConnectionFailures(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	ctx := context.Background()
+	model := "test-model"
+
+	// Force connection failure by stopping miniredis
+	mr.Close()
+
+	// Test various operations with failed connection
+	tests := []struct {
+		name string
+		op   func() error
+	}{
+		{
+			name: "RecordLatency",
+			op: func() error {
+				return client.RecordLatency(ctx, model, 1.0, "success")
+			},
+		},
+		{
+			name: "GetAverageLatency",
+			op: func() error {
+				_, err := client.GetAverageLatency(ctx, model, 5)
+				return err
+			},
+		},
+		{
+			name: "RecordErrorCode",
+			op: func() error {
+				return client.RecordErrorCode(ctx, model, 500)
+			},
+		},
+		{
+			name: "GetErrorPercentages",
+			op: func() error {
+				_, err := client.GetErrorPercentages(ctx, model, 5)
+				return err
+			},
+		},
+		{
+			name: "CleanupOldLatencies",
+			op: func() error {
+				return client.CleanupOldLatencies(ctx, model, time.Hour)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.op()
+			if err == nil {
+				t.Errorf("%s: expected error for disconnected Redis, got nil", tt.name)
+			}
+		})
+	}
+}
+
+func TestCleanupWithInvalidData(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Add some valid data
+	err := client.RecordLatency(ctx, model, 1.0, "success")
+	if err != nil {
+		t.Fatalf("RecordLatency() error = %v", err)
+	}
+
+	// Add invalid data directly to Redis
+	key := fmt.Sprintf("latency:%s", model)
+	score := float64(time.Now().UTC().Unix())
+	invalidData := "invalid-data"
+	err = client.rdb.ZAdd(ctx, key, redis.Z{Score: score, Member: invalidData}).Err()
+	if err != nil {
+		t.Fatalf("Failed to add invalid data: %v", err)
+	}
+
+	// Cleanup should still work
+	err = client.CleanupOldLatencies(ctx, model, time.Hour)
+	if err != nil {
+		t.Errorf("CleanupOldLatencies() error = %v", err)
+	}
+
+	// Valid data should still be retrievable
+	entries, err := client.GetLatencyEntries(ctx, model, 10)
+	if err != nil {
+		t.Fatalf("GetLatencyEntries() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("Expected 1 valid entry after cleanup, got %d", len(entries))
+	}
+}
+
+func TestSetRecoveryTimeWithExistingData(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Add some latency data
+	for i := 0; i < 5; i++ {
+		err := client.RecordLatency(ctx, model, float64(i), "success")
+		if err != nil {
+			t.Fatalf("RecordLatency() error = %v", err)
+		}
+	}
+
+	// Set recovery time
+	duration := time.Minute
+	err := client.SetRecoveryTime(ctx, model, duration)
+	if err != nil {
+		t.Fatalf("SetRecoveryTime() error = %v", err)
+	}
+
+	// Verify latency data was cleaned
+	entries, err := client.GetLatencyEntries(ctx, model, 10)
+	if err != nil {
+		t.Fatalf("GetLatencyEntries() error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Expected 0 entries after setting recovery time, got %d", len(entries))
+	}
+
+	// Verify counter was reset
+	counterKey := fmt.Sprintf("latency:%s:counter", model)
+	exists, err := client.rdb.Exists(ctx, counterKey).Result()
+	if err != nil {
+		t.Fatalf("Failed to check counter existence: %v", err)
+	}
+	if exists != 0 {
+		t.Error("Expected counter to be deleted")
+	}
+}
+
+func TestGetKeysWithPrefixEdgeCases(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// Test with empty prefix
+	keys, err := client.GetKeysWithPrefix(ctx, "")
+	if err != nil {
+		t.Fatalf("GetKeysWithPrefix() error = %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("Expected 0 keys for empty prefix, got %d", len(keys))
+	}
+
+	// Add some test keys
+	testData := map[string]string{
+		"test:key1":     "value1",
+		"test:key2":     "value2",
+		"other:key1":    "value3",
+		"test:sub:key1": "value4",
+	}
+	for k, v := range testData {
+		err := client.rdb.Set(ctx, k, v, 0).Err()
+		if err != nil {
+			t.Fatalf("Failed to set test key: %v", err)
+		}
+	}
+
+	// Test with specific prefix - note the wildcard pattern
+	keys, err = client.GetKeysWithPrefix(ctx, "test:*")
+	if err != nil {
+		t.Fatalf("GetKeysWithPrefix() error = %v", err)
+	}
+	if len(keys) != 3 {
+		t.Errorf("Expected 3 keys with prefix 'test:*', got %d", len(keys))
+	}
+
+	// Test with non-existent prefix
+	keys, err = client.GetKeysWithPrefix(ctx, "nonexistent:*")
+	if err != nil {
+		t.Fatalf("GetKeysWithPrefix() error = %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("Expected 0 keys for non-existent prefix, got %d", len(keys))
+	}
+}
+
+func TestClearAllModelDataWithInvalidData(t *testing.T) {
+	client, mr := setupTestRedis(t)
+	defer mr.Close()
+	defer client.Close()
+
+	ctx := context.Background()
+	model := "test-model"
+
+	// Add some valid data
+	err := client.RecordLatency(ctx, model, 1.0, "success")
+	if err != nil {
+		t.Fatalf("RecordLatency() error = %v", err)
+	}
+	err = client.RecordErrorCode(ctx, model, 500)
+	if err != nil {
+		t.Fatalf("RecordErrorCode() error = %v", err)
+	}
+
+	// Add some invalid data directly
+	invalidKeys := []string{
+		fmt.Sprintf("latency:%s:invalid", model),
+		fmt.Sprintf("errors:%s:invalid", model),
+	}
+	for _, key := range invalidKeys {
+		err := client.rdb.Set(ctx, key, "invalid", 0).Err()
+		if err != nil {
+			t.Fatalf("Failed to set invalid key: %v", err)
+		}
+	}
+
+	// Clear all data
+	err = client.ClearAllModelData(ctx, model)
+	if err != nil {
+		t.Fatalf("ClearAllModelData() error = %v", err)
+	}
+
+	// Verify all keys are cleared
+	keys, err := client.GetKeysWithPrefix(ctx, fmt.Sprintf("%s:", model))
+	if err != nil {
+		t.Fatalf("GetKeysWithPrefix() error = %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("Expected 0 keys after clearing, got %d", len(keys))
 	}
 }

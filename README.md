@@ -234,6 +234,52 @@ config := notdiamond.Config{
 }
 ```
 
+### Redis Data Management
+
+The SDK uses Redis to store metrics for model performance tracking, including latency and error rates. To prevent Redis from accumulating excessive data over time, the following data management features are available:
+
+#### Automatic Cleanup
+
+1. When a model exits a recovery period (due to latency or errors), old data is automatically cleaned up
+2. A periodic background cleanup process can run at configurable intervals
+
+Configure Redis data management through environment variables:
+
+```
+# Redis Data Cleanup Configuration
+ENABLE_REDIS_PERIODIC_CLEANUP=true    # Enable/disable periodic background cleanup
+REDIS_CLEANUP_INTERVAL=6h             # How often to run cleanup (accepts Go duration format)
+REDIS_DATA_RETENTION=24h              # How long to keep data before cleanup
+```
+
+Or add these to your `.env` file:
+
+```
+# Redis Configuration
+REDIS_ADDR=localhost:6379
+REDIS_PASSWORD=
+REDIS_DB=0
+# Redis Data Cleanup Configuration
+ENABLE_REDIS_PERIODIC_CLEANUP=true
+REDIS_CLEANUP_INTERVAL=6h
+REDIS_DATA_RETENTION=24h
+```
+
+The periodic cleanup process:
+
+- Runs in a separate goroutine to avoid impacting application performance
+- Identifies all models with data in Redis
+- Removes data older than the specified retention period
+- Logs cleanup activities for monitoring
+
+#### Data Retention Policy
+
+By default, the SDK retains 24 hours of data for both latency and error tracking. This allows for:
+
+- Sufficient historical data for performance analysis
+- Trend detection for model reliability
+- Prevention of Redis memory growth in high-traffic scenarios
+
 ## Error Rate Fallback
 
 Configure custom error rate thresholds and recovery time for each model, with different thresholds for different status codes:
@@ -283,3 +329,12 @@ This allows for fine-grained control over error handling:
 - Configure different number of calls and recovery times per status code
 - Track any HTTP status code you want to monitor
 - Configure different thresholds for different models based on their reliability
+
+## Parser
+
+The parser is a function that parses the response from the API and returns the response in a structured format.
+
+```go
+// Import from https://github.com/Not-Diamond/go-notdiamond/pkg/http/response
+result, err := response.Parse(body, startTime)
+```

@@ -84,5 +84,6 @@ type Config struct {
 	RedisConfig        *redis.Config // Redis configuration for metrics tracking
 	VertexProjectID    string
 	VertexLocation     string
-	AzureAPIVersion    string // Azure API version to use for requests
+	AzureAPIVersion    string            // Azure API version to use for requests
+	AzureRegions       map[string]string // Map of region names to Azure endpoints
 }

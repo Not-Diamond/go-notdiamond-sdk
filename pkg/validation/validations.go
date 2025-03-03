@@ -99,16 +99,27 @@ func validateModelName(model string) error {
 	}
 
 	parts := strings.Split(model, "/")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid model format: %s (expected 'provider/model')", model)
+
+	// Handle provider/model format
+	if len(parts) == 2 {
+		provider := parts[0]
+		if err := validateProvider(provider); err != nil {
+			return fmt.Errorf("invalid provider in model %s: %w", model, err)
+		}
+		return nil
 	}
 
-	provider := parts[0]
-	if err := validateProvider(provider); err != nil {
-		return fmt.Errorf("invalid provider in model %s: %w", model, err)
+	// Handle provider/model/region format
+	if len(parts) == 3 {
+		provider := parts[0]
+		if err := validateProvider(provider); err != nil {
+			return fmt.Errorf("invalid provider in model %s: %w", model, err)
+		}
+		// We don't validate the region as it can be any string
+		return nil
 	}
 
-	return nil
+	return fmt.Errorf("invalid model format: %s (expected 'provider/model' or 'provider/model/region')", model)
 }
 
 // validateProvider validates the provider for the NotDiamond client.

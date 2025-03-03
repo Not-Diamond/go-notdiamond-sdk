@@ -169,11 +169,11 @@ func TestValidateOrderedModels(t *testing.T) {
 			name: "invalid model in list",
 			models: []string{
 				"openai/gpt-4",
-				"invalid/model/format",
+				"invalid/model/format/toomany",
 				"azure/gpt-4",
 			},
 			wantErr:     true,
-			errContains: "invalid model format: invalid/model/format",
+			errContains: "invalid model format: invalid/model/format/toomany",
 		},
 		{
 			name: "unknown provider in list",
@@ -226,10 +226,10 @@ func TestValidateModelNames(t *testing.T) {
 			name: "invalid model in list",
 			models: []string{
 				"openai/gpt-4",
-				"invalid/model/format",
+				"invalid/model/format/toomany",
 			},
 			wantErr:     true,
-			errContains: "invalid model format: invalid/model/format",
+			errContains: "invalid model format: invalid/model/format/toomany",
 		},
 		{
 			name: "unknown provider in list",
@@ -294,13 +294,13 @@ func TestValidateModelName(t *testing.T) {
 			name:        "missing provider",
 			model:       "gpt-4",
 			wantErr:     true,
-			errContains: "invalid model format: gpt-4 (expected 'provider/model')",
+			errContains: "invalid model format: gpt-4 (expected 'provider/model' or 'provider/model/region')",
 		},
 		{
 			name:        "too many parts",
-			model:       "openai/gpt-4/extra",
+			model:       "openai/gpt-4/extra/toomany",
 			wantErr:     true,
-			errContains: "invalid model format: openai/gpt-4/extra (expected 'provider/model')",
+			errContains: "invalid model format: openai/gpt-4/extra/toomany (expected 'provider/model' or 'provider/model/region')",
 		},
 		{
 			name:        "unknown provider",

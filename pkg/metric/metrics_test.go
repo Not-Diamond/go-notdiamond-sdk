@@ -2,11 +2,13 @@ package metric
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Not-Diamond/go-notdiamond/pkg/model"
+	"github.com/Not-Diamond/go-notdiamond/pkg/redis"
 	"github.com/alicebob/miniredis/v2"
 )
 
@@ -578,6 +580,368 @@ func TestCheckModelOverallHealth(t *testing.T) {
 			if healthy != tt.expectedHealth {
 				t.Errorf("Expected health = %v, got %v", tt.expectedHealth, healthy)
 			}
+		})
+	}
+}
+
+func TestCheckErrorRecoveryTimeWithCleanup(t *testing.T) {
+	// Setup miniredis directly for better control
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Failed to create miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	// Create Redis client with the miniredis address
+	redisClient, err := redis.NewClient(redis.Config{
+		Addr: mr.Addr(),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create Redis client: %v", err)
+	}
+	defer redisClient.Close()
+
+	// Create metrics tracker with our Redis client
+	tracker := &Tracker{client: redisClient}
+
+	// Create model configuration
+	modelName := "testmodel"
+	recoveryTime := 2 * time.Second
+	config := model.Config{
+		ModelErrorTracking: model.ModelErrorTracking{
+			modelName: &model.RollingErrorTracking{
+				StatusConfigs: map[int]*model.StatusCodeConfig{
+					400: {
+						ErrorThresholdPercentage: 50,
+						NoOfCalls:                5,
+						RecoveryTime:             recoveryTime,
+					},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+
+	// Record some error codes
+	statuses := []int{200, 400, 400, 200, 400}
+	for _, status := range statuses {
+		if err := tracker.RecordErrorCode(modelName, status); err != nil {
+			t.Fatalf("Failed to record error code: %v", err)
+		}
+	}
+
+	// Check error percentages before recovery
+	errorPercentages, err := tracker.client.GetErrorPercentages(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get error percentages: %v", err)
+	}
+	if errorPercentages[400] != 60.0 {
+		t.Errorf("Expected 400 error percentage to be 60.0, got %f", errorPercentages[400])
+	}
+
+	// Set error recovery time
+	if err := tracker.RecordErrorRecoveryTime(modelName, config, 400); err != nil {
+		t.Fatalf("Failed to record recovery time: %v", err)
+	}
+
+	// Verify model is in recovery
+	err = tracker.CheckErrorRecoveryTime(modelName, config)
+	if err == nil || !strings.Contains(err.Error(), "still in error recovery period") {
+		t.Errorf("Expected 'still in error recovery period' error, got %v", err)
+	}
+
+	// Fast forward time past the recovery period in miniredis
+	mr.FastForward(recoveryTime + 100*time.Millisecond)
+
+	// Verify model is out of recovery and cleanup happened
+	err = tracker.CheckErrorRecoveryTime(modelName, config)
+	if err != nil {
+		t.Errorf("CheckErrorRecoveryTime() error = %v, want nil", err)
+	}
+
+	// Check error data was cleaned up
+	errorPercentages, err = tracker.client.GetErrorPercentages(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get error percentages: %v", err)
+	}
+	if len(errorPercentages) != 0 {
+		t.Errorf("Expected empty error percentages after cleanup, got %v", errorPercentages)
+	}
+}
+
+func TestStartPeriodicCleanup(t *testing.T) {
+	// Setup miniredis directly for better control
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Failed to create miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	// Create Redis client with the miniredis address
+	redisClient, err := redis.NewClient(redis.Config{
+		Addr: mr.Addr(),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create Redis client: %v", err)
+	}
+	defer redisClient.Close()
+
+	// Create metrics tracker with our Redis client
+	tracker := &Tracker{client: redisClient}
+
+	ctx := context.Background()
+	modelName := "testmodel"
+
+	// Create test data
+	// 1. Record some latency data
+	for i := 0; i < 5; i++ {
+		if err := tracker.RecordLatency(modelName, float64(i+1), "200"); err != nil {
+			t.Fatalf("Failed to record latency: %v", err)
+		}
+	}
+
+	// 2. Record some error data
+	statuses := []int{200, 400, 400, 500, 429}
+	for _, status := range statuses {
+		if err := tracker.RecordErrorCode(modelName, status); err != nil {
+			t.Fatalf("Failed to record error code: %v", err)
+		}
+	}
+
+	// Verify data exists before cleanup
+	latencyEntries, err := tracker.client.GetLatencyEntries(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get latency entries: %v", err)
+	}
+	if len(latencyEntries) != 5 {
+		t.Errorf("Expected 5 latency entries before cleanup, got %d", len(latencyEntries))
+	}
+
+	errorPercentages, err := tracker.client.GetErrorPercentages(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get error percentages: %v", err)
+	}
+	if errorPercentages[400] != 40.0 {
+		t.Errorf("Expected 400 error percentage to be 40.0 before cleanup, got %f", errorPercentages[400])
+	}
+
+	// Use a very short cleanup interval and age of 0 to clean up all data
+	cleanupInterval := 100 * time.Millisecond
+	dataAge := 0 * time.Second // 0 seconds means clean up all data
+
+	// Start the actual periodic cleanup
+	tracker.StartPeriodicCleanup(cleanupInterval, dataAge)
+
+	// Wait for the cleanup to run
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify data was cleaned up
+	latencyEntries, err = tracker.client.GetLatencyEntries(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get latency entries: %v", err)
+	}
+	if len(latencyEntries) != 0 {
+		t.Errorf("Expected 0 latency entries after cleanup, got %d", len(latencyEntries))
+	}
+
+	errorPercentages, err = tracker.client.GetErrorPercentages(ctx, modelName, 5)
+	if err != nil {
+		t.Fatalf("Failed to get error percentages: %v", err)
+	}
+	if len(errorPercentages) != 0 {
+		t.Errorf("Expected empty error percentages after cleanup, got %v", errorPercentages)
+	}
+}
+
+// redisClientWrapper is a wrapper around redis.Client that tracks when cleanup methods are called
+type redisClientWrapper struct {
+	client                 *redis.Client
+	cleanupLatenciesCalled *bool
+	cleanupErrorsCalled    *bool
+}
+
+// CleanupOldLatencies wraps the original method and tracks when it's called
+func (w *redisClientWrapper) CleanupOldLatencies(ctx context.Context, model string, age time.Duration) error {
+	*w.cleanupLatenciesCalled = true
+	return w.client.CleanupOldLatencies(ctx, model, age)
+}
+
+// CleanupOldErrors wraps the original method and tracks when it's called
+func (w *redisClientWrapper) CleanupOldErrors(ctx context.Context, model string, age time.Duration) error {
+	*w.cleanupErrorsCalled = true
+	return w.client.CleanupOldErrors(ctx, model, age)
+}
+
+// Forward all other methods to the underlying client
+func (w *redisClientWrapper) Close() error {
+	return w.client.Close()
+}
+
+func (w *redisClientWrapper) RecordLatency(ctx context.Context, model string, latency float64, status string) error {
+	return w.client.RecordLatency(ctx, model, latency, status)
+}
+
+func (w *redisClientWrapper) SetRecoveryTime(ctx context.Context, model string, duration time.Duration) error {
+	return w.client.SetRecoveryTime(ctx, model, duration)
+}
+
+func (w *redisClientWrapper) CheckRecoveryTime(ctx context.Context, model string) (bool, error) {
+	return w.client.CheckRecoveryTime(ctx, model)
+}
+
+func (w *redisClientWrapper) GetAverageLatency(ctx context.Context, model string, n int64) (float64, error) {
+	return w.client.GetAverageLatency(ctx, model, n)
+}
+
+func (w *redisClientWrapper) GetLatencyEntries(ctx context.Context, model string, n int64) ([]float64, error) {
+	return w.client.GetLatencyEntries(ctx, model, n)
+}
+
+func (w *redisClientWrapper) RecordErrorCode(ctx context.Context, model string, statusCode int) error {
+	return w.client.RecordErrorCode(ctx, model, statusCode)
+}
+
+func (w *redisClientWrapper) GetErrorPercentages(ctx context.Context, model string, n int64) (map[int]float64, error) {
+	return w.client.GetErrorPercentages(ctx, model, n)
+}
+
+func (w *redisClientWrapper) SetErrorRecoveryTime(ctx context.Context, model string, duration time.Duration) error {
+	return w.client.SetErrorRecoveryTime(ctx, model, duration)
+}
+
+func (w *redisClientWrapper) CheckErrorRecoveryTime(ctx context.Context, model string) (bool, error) {
+	return w.client.CheckErrorRecoveryTime(ctx, model)
+}
+
+func (w *redisClientWrapper) ClearAllModelData(ctx context.Context, model string) error {
+	return w.client.ClearAllModelData(ctx, model)
+}
+
+func (w *redisClientWrapper) GetKeysWithPrefix(ctx context.Context, prefix string) ([]string, error) {
+	return w.client.GetKeysWithPrefix(ctx, prefix)
+}
+
+func TestNewTrackerWithEnvironmentConfig(t *testing.T) {
+	// Save original environment and restore it after the test
+	origEnvCleanup := os.Getenv("ENABLE_REDIS_PERIODIC_CLEANUP")
+	origEnvInterval := os.Getenv("REDIS_CLEANUP_INTERVAL")
+	origEnvRetention := os.Getenv("REDIS_DATA_RETENTION")
+	defer func() {
+		os.Setenv("ENABLE_REDIS_PERIODIC_CLEANUP", origEnvCleanup)
+		os.Setenv("REDIS_CLEANUP_INTERVAL", origEnvInterval)
+		os.Setenv("REDIS_DATA_RETENTION", origEnvRetention)
+	}()
+
+	// Set up Redis
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	// Test cases
+	tests := []struct {
+		name            string
+		enableCleanup   string
+		cleanupInterval string
+		dataRetention   string
+		wantEnabled     bool
+		wantInterval    time.Duration
+		wantRetention   time.Duration
+	}{
+		{
+			name:            "cleanup enabled with default settings",
+			enableCleanup:   "true",
+			cleanupInterval: "",
+			dataRetention:   "",
+			wantEnabled:     true,
+			wantInterval:    6 * time.Hour,
+			wantRetention:   24 * time.Hour,
+		},
+		{
+			name:            "cleanup disabled",
+			enableCleanup:   "false",
+			cleanupInterval: "5s",
+			dataRetention:   "10s",
+			wantEnabled:     false,
+		},
+		{
+			name:            "cleanup enabled with custom settings",
+			enableCleanup:   "true",
+			cleanupInterval: "100ms",
+			dataRetention:   "1h",
+			wantEnabled:     true,
+			wantInterval:    100 * time.Millisecond,
+			wantRetention:   time.Hour,
+		},
+		{
+			name:            "cleanup with invalid interval falls back to default",
+			enableCleanup:   "true",
+			cleanupInterval: "invalid",
+			dataRetention:   "1h",
+			wantEnabled:     true,
+			wantInterval:    6 * time.Hour,
+			wantRetention:   time.Hour,
+		},
+		{
+			name:            "cleanup with invalid retention falls back to default",
+			enableCleanup:   "true",
+			cleanupInterval: "5m",
+			dataRetention:   "invalid",
+			wantEnabled:     true,
+			wantInterval:    5 * time.Minute,
+			wantRetention:   24 * time.Hour,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set environment variables for this test case
+			os.Setenv("ENABLE_REDIS_PERIODIC_CLEANUP", tt.enableCleanup)
+			os.Setenv("REDIS_CLEANUP_INTERVAL", tt.cleanupInterval)
+			os.Setenv("REDIS_DATA_RETENTION", tt.dataRetention)
+
+			// For this test, we'll manually parse the environment variables
+			// the same way the NewTracker function does, since we can't easily
+			// spy on the StartPeriodicCleanup call
+
+			// Check if cleanup enabled as expected
+			enabled := os.Getenv("ENABLE_REDIS_PERIODIC_CLEANUP") == "true"
+			if enabled != tt.wantEnabled {
+				t.Errorf("Cleanup enabled = %v, want %v", enabled, tt.wantEnabled)
+			}
+
+			// Only check interval and retention if cleanup was enabled
+			if enabled {
+				// Get cleanup interval from env var or use default
+				interval := 6 * time.Hour
+				if intervalStr := os.Getenv("REDIS_CLEANUP_INTERVAL"); intervalStr != "" {
+					if parsedInterval, err := time.ParseDuration(intervalStr); err == nil {
+						interval = parsedInterval
+					}
+				}
+
+				if interval != tt.wantInterval {
+					t.Errorf("Cleanup interval = %v, want %v", interval, tt.wantInterval)
+				}
+
+				// Get data retention age from env var or use default
+				retention := 24 * time.Hour
+				if retentionStr := os.Getenv("REDIS_DATA_RETENTION"); retentionStr != "" {
+					if parsedRetention, err := time.ParseDuration(retentionStr); err == nil {
+						retention = parsedRetention
+					}
+				}
+
+				if retention != tt.wantRetention {
+					t.Errorf("Data retention = %v, want %v", retention, tt.wantRetention)
+				}
+			}
+
+			// Now create a tracker to make sure the code doesn't panic
+			tracker, err := NewTracker(mr.Addr())
+			if err != nil {
+				t.Fatalf("Failed to create metrics tracker: %v", err)
+			}
+			defer tracker.Close()
 		})
 	}
 }

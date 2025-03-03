@@ -394,3 +394,15 @@ func (c *Client) ClearAllModelData(ctx context.Context, model string) error {
 	}
 	return c.rdb.Del(ctx, keys...).Err()
 }
+
+// GetKeysWithPrefix returns all Redis keys that match the given prefix pattern
+func (c *Client) GetKeysWithPrefix(ctx context.Context, prefix string) ([]string, error) {
+	// Use the KEYS command with a pattern
+	// Note: This is okay for maintenance operations like cleanup, but should be used carefully in production
+	// with large datasets as it can block Redis
+	keys, err := c.rdb.Keys(ctx, prefix).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get keys with prefix %s: %v", prefix, err)
+	}
+	return keys, nil
+}

@@ -1,4 +1,4 @@
-package notdiamond
+package transport
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 
 	"bytes"
 
+	http_client "github.com/Not-Diamond/go-notdiamond/pkg/http/client"
 	"github.com/Not-Diamond/go-notdiamond/pkg/http/request"
 	"github.com/Not-Diamond/go-notdiamond/pkg/metric"
 	"github.com/Not-Diamond/go-notdiamond/pkg/model"
@@ -19,7 +20,7 @@ import (
 
 type Transport struct {
 	Base           http.RoundTripper
-	client         *Client
+	client         *http_client.Client
 	metricsTracker *metric.Tracker
 	config         model.Config
 }
@@ -46,17 +47,17 @@ func NewTransport(config model.Config) (*Transport, error) {
 
 	baseClient := &http.Client{Transport: http.DefaultTransport}
 
-	ndHttpClient := &NotDiamondHttpClient{
+	ndHttpClient := &http_client.NotDiamondHttpClient{
 		Client:         baseClient,
-		config:         config,
-		metricsTracker: metricsTracker,
+		Config:         config,
+		MetricsTracker: metricsTracker,
 	}
 
-	client := &Client{
-		clients:        config.Clients,
-		models:         config.Models,
-		modelProviders: buildModelProviders(config.Models),
-		isOrdered:      isOrderedModels(config.Models),
+	client := &http_client.Client{
+		Clients:        config.Clients,
+		Models:         config.Models,
+		ModelProviders: buildModelProviders(config.Models),
+		IsOrdered:      isOrderedModels(config.Models),
 		HttpClient:     ndHttpClient,
 	}
 
@@ -86,7 +87,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Add client to context and proceed with request
-	ctx := context.WithValue(req.Context(), clientKey, t.client)
+	ctx := context.WithValue(req.Context(), http_client.ClientKey, t.client)
 	req = req.WithContext(ctx)
 
 	return t.client.HttpClient.Do(req)
@@ -94,7 +95,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // updateRequestWithCombinedMessages updates the request with combined messages.
 func updateRequestWithCombinedMessages(req *http.Request, modelMessages []model.Message, messages []model.Message, extractedModel string) error {
-	combinedMessages, err := combineMessages(modelMessages, messages)
+	combinedMessages, err := http_client.CombineMessages(modelMessages, messages)
 	if err != nil {
 		return err
 	}

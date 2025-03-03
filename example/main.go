@@ -4,18 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/Not-Diamond/go-notdiamond/pkg/clients/azure"
+	"github.com/Not-Diamond/go-notdiamond/pkg/clients/openai"
+	"github.com/Not-Diamond/go-notdiamond/pkg/clients/vertex"
 	"io"
 	"log"
 	"net/http"
 	"time"
 
-	"github.com/Not-Diamond/go-notdiamond"
+	"github.com/Not-Diamond/go-notdiamond/pkg/http/response"
+	"github.com/Not-Diamond/go-notdiamond/pkg/transport"
 
-	"example/azure"
 	"example/config"
-	"example/openai"
-	"example/response"
-	"example/vertex"
 )
 
 func main() {
@@ -45,8 +45,14 @@ func main() {
 	}
 	modelConfig.RedisConfig = &cfg.RedisConfig
 
+	// Set up Azure regions
+	modelConfig.AzureRegions = map[string]string{
+		"eastus":     cfg.AzureEndpoint,
+		"westeurope": "https://custom-westeurope.openai.azure.com",
+	}
+
 	// Create transport with configuration
-	transport, err := notdiamond.NewTransport(modelConfig)
+	transport, err := transport.NewTransport(modelConfig)
 	if err != nil {
 		log.Fatalf("Failed to create transport: %v", err)
 	}
@@ -86,7 +92,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to marshal payload: %v", err)
 		}
-		req, err = vertex.NewRequest(cfg.VertexProjectID, cfg.VertexLocation)
+		req, err = http.NewRequest("POST", vertexRequest.URL.String(), io.NopCloser(bytes.NewBuffer(jsonData)))
+		if err != nil {
+			log.Fatalf("Failed to create request: %v", err)
+		}
+		// Copy headers from the vertex request
+		for key, values := range vertexRequest.Header {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
 	} else {
 		openaiPayload := map[string]interface{}{
 			"model": "gpt-4o-mini", // Non-existent model to trigger fallback
@@ -101,14 +116,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to marshal payload: %v", err)
 		}
-		req, err = openai.NewRequest("https://api.openai.com/v1/chat/completions", cfg.OpenAIAPIKey)
+		req, err = http.NewRequest("POST", azureRequest.URL.String(), io.NopCloser(bytes.NewBuffer(jsonData)))
+		if err != nil {
+			log.Fatalf("Failed to create request: %v", err)
+		}
+		// Copy headers from the openai request
+		for key, values := range azureRequest.Header {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
 	}
-
-	if err != nil {
-		log.Fatalf("Failed to create request: %v", err)
-	}
-
-	req.Body = io.NopCloser(bytes.NewBuffer(jsonData))
 
 	// Make request with transport client
 	start := time.Now()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -30,7 +31,35 @@ func NewTracker(redisAddr string) (*Tracker, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
-	return &Tracker{client: client}, nil
+	tracker := &Tracker{client: client}
+
+	// Only start periodic cleanup if enabled by environment variable
+	if enabledStr := os.Getenv("ENABLE_REDIS_PERIODIC_CLEANUP"); enabledStr == "true" {
+		// Get cleanup interval from env var or use default
+		interval := 6 * time.Hour
+		if intervalStr := os.Getenv("REDIS_CLEANUP_INTERVAL"); intervalStr != "" {
+			if parsedInterval, err := time.ParseDuration(intervalStr); err == nil {
+				interval = parsedInterval
+			} else {
+				slog.Warn("Invalid REDIS_CLEANUP_INTERVAL value, using default", "value", intervalStr, "default", interval)
+			}
+		}
+
+		// Get data retention age from env var or use default
+		retention := 24 * time.Hour
+		if retentionStr := os.Getenv("REDIS_DATA_RETENTION"); retentionStr != "" {
+			if parsedRetention, err := time.ParseDuration(retentionStr); err == nil {
+				retention = parsedRetention
+			} else {
+				slog.Warn("Invalid REDIS_DATA_RETENTION value, using default", "value", retentionStr, "default", retention)
+			}
+		}
+
+		// Start the periodic cleanup
+		go tracker.StartPeriodicCleanup(interval, retention)
+	}
+
+	return tracker, nil
 }
 
 // Close closes the Redis connection
@@ -173,6 +202,12 @@ func (mt *Tracker) CheckErrorRecoveryTime(model string, config model.Config) err
 	// Model has just come out of recovery, log this event
 	slog.Info("🔄 Model has recovered from error state", "model", model)
 
+	// Clean up old error data when recovery period ends
+	age := 24 * time.Hour // Keep last 24 hours of data
+	if err := mt.client.CleanupOldErrors(ctx, model, age); err != nil {
+		slog.Error("Failed to cleanup old error data", "error", err)
+	}
+
 	return nil
 }
 
@@ -271,4 +306,71 @@ func (mt *Tracker) CheckModelOverallHealth(model string, config model.Config) (b
 	default:
 		return true, nil
 	}
+}
+
+// StartPeriodicCleanup starts a background goroutine that periodically cleans up
+// old latency and error data for all models it finds in Redis.
+// cleanupInterval: how often to run the cleanup
+// dataAge: how old data should be before it's cleaned up
+func (mt *Tracker) StartPeriodicCleanup(cleanupInterval, dataAge time.Duration) {
+	ticker := time.NewTicker(cleanupInterval)
+	ctx := context.Background()
+
+	slog.Info("🧹 Starting periodic Redis data cleanup",
+		"interval", cleanupInterval.String(),
+		"data_retention", dataAge.String())
+
+	go func() {
+		for range ticker.C {
+			// Get all known models from Redis latency keys
+			latencyKeys, err := mt.client.GetKeysWithPrefix(ctx, "latency:*")
+			if err != nil {
+				slog.Error("Failed to get latency keys for cleanup", "error", err)
+				continue
+			}
+
+			// Extract model names from the latency keys
+			models := make(map[string]bool)
+			for _, key := range latencyKeys {
+				// Parse model name from key format "latency:model"
+				parts := strings.Split(key, ":")
+				if len(parts) >= 2 && parts[0] == "latency" && !strings.Contains(parts[1], "recovery") && !strings.Contains(parts[1], "counter") {
+					models[parts[1]] = true
+				}
+			}
+
+			// Get all known models from Redis error keys
+			errorKeys, err := mt.client.GetKeysWithPrefix(ctx, "errors:*")
+			if err != nil {
+				slog.Error("Failed to get error keys for cleanup", "error", err)
+				continue
+			}
+
+			// Extract model names from the error keys
+			for _, key := range errorKeys {
+				// Parse model name from key format "errors:model"
+				parts := strings.Split(key, ":")
+				if len(parts) >= 2 && parts[0] == "errors" && !strings.Contains(parts[1], "recovery") && !strings.Contains(parts[1], "counter") {
+					models[parts[1]] = true
+				}
+			}
+
+			// Clean up data for each model
+			for model := range models {
+				slog.Info("🧹 Cleaning up old data for model", "model", model)
+
+				// Clean up old latency data
+				if err := mt.client.CleanupOldLatencies(ctx, model, dataAge); err != nil {
+					slog.Error("Failed to clean up old latency data", "model", model, "error", err)
+				}
+
+				// Clean up old error data
+				if err := mt.client.CleanupOldErrors(ctx, model, dataAge); err != nil {
+					slog.Error("Failed to clean up old error data", "model", model, "error", err)
+				}
+			}
+
+			slog.Info("🧹 Completed periodic cleanup", "models_processed", len(models))
+		}
+	}()
 }

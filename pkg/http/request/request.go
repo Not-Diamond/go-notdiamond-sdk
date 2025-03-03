@@ -45,11 +45,24 @@ func ExtractModelFromRequest(req *http.Request) (string, error) {
 		return "", fmt.Errorf("model field not found or not a string")
 	}
 
-	// If it's in provider/model format, extract just the model part
+	// Check if the model string contains a region (format: model/region)
 	parts := strings.Split(modelStr, "/")
-	if len(parts) == 2 {
+
+	// If it's in provider/model format, extract just the model part
+	if len(parts) == 2 && (parts[0] == "openai" || parts[0] == "azure" || parts[0] == "vertex") {
 		return parts[1], nil // Return just the model part
 	}
+
+	// If it's in model/region format, keep it as is to preserve the region information
+	if len(parts) == 2 && parts[0] != "openai" && parts[0] != "azure" && parts[0] != "vertex" {
+		return modelStr, nil // Return model/region
+	}
+
+	// If it's in provider/model/region format, extract model/region
+	if len(parts) == 3 {
+		return parts[1] + "/" + parts[2], nil // Return model/region
+	}
+
 	return modelStr, nil
 }
 
@@ -68,18 +81,41 @@ func ExtractProviderFromRequest(req *http.Request) string {
 		return "vertex"
 	}
 
-	// If not found in URL, try to extract from model name
-	model, err := ExtractModelFromRequest(req)
-	if err != nil {
-		slog.Error("❌ Error extracting model from request", "error", err)
+	// If not found in URL, try to extract from model name in the request body
+	if req.Body == nil {
 		return ""
 	}
-	if strings.HasPrefix(model, "vertex/") {
-		return "vertex"
-	} else if strings.HasPrefix(model, "azure/") {
-		return "azure"
-	} else if strings.HasPrefix(model, "openai/") {
-		return "openai"
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		slog.Error("❌ Error reading request body", "error", err)
+		return ""
+	}
+
+	// Restore the body for future reads
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		slog.Error("❌ Error unmarshaling request body", "error", err)
+		return ""
+	}
+
+	modelStr, ok := payload["model"].(string)
+	if !ok {
+		slog.Error("❌ Model field not found or not a string")
+		return ""
+	}
+
+	// Check if the model string contains a provider
+	parts := strings.Split(modelStr, "/")
+
+	// If it's in provider/model format or provider/model/region format
+	if len(parts) >= 2 {
+		provider := parts[0]
+		if provider == "vertex" || provider == "azure" || provider == "openai" {
+			return provider
+		}
 	}
 
 	return ""
@@ -203,12 +239,28 @@ func TransformToVertexRequest(body []byte, model string) ([]byte, error) {
 		Extra            map[string]interface{}   `json:"extra,omitempty"`
 	}
 
-	// Extract just the model name if it contains a provider prefix
+	// Extract just the model name if it contains a provider prefix or region
 	modelName := model
 	if strings.Contains(model, "/") {
 		parts := strings.Split(model, "/")
-		modelName = parts[1]
+		if len(parts) >= 2 {
+			// For format: provider/model or model/region
+			modelName = parts[1]
+
+			// If it's provider/model/region format, we just want the model part
+			if len(parts) > 2 && parts[0] == "vertex" {
+				modelName = parts[1]
+			}
+		}
 	}
+
+	// Default to gemini-pro if no model is specified
+	if modelName == "" {
+		modelName = "gemini-pro"
+		slog.Info("⚠️ No model specified, defaulting to gemini-pro")
+	}
+
+	slog.Info("🔄 Transforming to Vertex format", "model", modelName)
 
 	vertexPayload := VertexPayload{
 		Model:    modelName,
@@ -238,6 +290,11 @@ func TransformToVertexRequest(body []byte, model string) ([]byte, error) {
 
 	if len(openAIPayload.Stop) > 0 {
 		vertexPayload.StopSequences = openAIPayload.Stop
+	}
+
+	// Initialize Extra if nil
+	if vertexPayload.Extra == nil {
+		vertexPayload.Extra = make(map[string]interface{})
 	}
 
 	// Copy any extra parameters
